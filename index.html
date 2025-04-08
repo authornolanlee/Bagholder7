@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>The Bagholder 7</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@1.4.0"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      padding: 20px;
+      background-color: #f9f9f9;
+    }
+    h1 {
+      font-size: 2rem;
+      margin-bottom: 10px;
+    }
+    canvas {
+      background: white;
+      border-radius: 8px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+    }
+    #rangeSelector, #benchmarkSelector, #yAxisControls {
+      margin: 10px;
+      padding: 10px;
+      font-size: 1rem;
+    }
+    table {
+      margin: 30px auto;
+      border-collapse: collapse;
+      width: 80%;
+      background: white;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+    }
+    th, td {
+      padding: 10px;
+      border: 1px solid #ddd;
+    }
+    th {
+      background-color: #f0f0f0;
+    }
+    #portfolioHistoryTable {
+      max-height: 400px;
+      overflow-y: auto;
+      display: block;
+      width: 80%;
+      margin: 30px auto;
+    }
+  </style>
+</head>
+<body>
+  <h1>Bagholder 7 (BAG7)</h1>
+
+  <select id="rangeSelector">
+    <option value="30">Last 30 Days</option>
+    <option value="ytd">Year to Date</option>
+    <option value="180">6 Months</option>
+    <option value="365">1 Year</option>
+    <option value="730">2 Years</option>
+    <option value="1825">5 Years</option>
+    <option value="3650">10 Years</option>
+    <option value="all">All Time</option>
+  </select>
+
+  <select id="benchmarkSelector">
+    <option value="">-- Compare to Index --</option>
+    <option value="^GSPC">S&P 500</option>
+    <option value="^IXIC">NASDAQ</option>
+    <option value="^DJI">DJIA</option>
+  </select>
+
+  <div id="yAxisControls">
+    Y-Axis Min: <input type="number" id="yMin" placeholder="Auto" />
+    Y-Axis Max: <input type="number" id="yMax" placeholder="Auto" />
+    <label style="margin-left: 10px;">
+      <input type="checkbox" id="percentToggle" checked /> Show % Return
+    </label>
+    <button onclick="renderChart(currentRange)">Apply</button>
+  </div>
+
+  <canvas id="portfolioChart" width="800" height="400"></canvas>
+  <div id="holdingsTable"></div>
+  <div id="portfolioHistoryTable"></div>
+
+  <script>
+    const portfolioDataNDJSON = `
+      {"Tickers": ["MSTR", "SAVA", "QBTS", "IONQ", "RGTI", "RIVN", "AMC"], "Proportions": [0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.1], "Dollars": 10000, "Date": "2025-01-01"}
+    `;
+
+    const parseNDJSON = (ndjson) => ndjson.trim().split('\n').map(line => JSON.parse(line));
+
+    const fetchYahooPrices = async (ticker, startDate, endDate) => {
+      try {
+        const start = Math.floor(new Date(startDate).getTime() / 1000);
+        const end = Math.floor(new Date(endDate).getTime() / 1000);
+        const proxyUrl = 'https://corsproxy.io/?';
+        const url = `${proxyUrl}https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?period1=${start}&period2=${end}&interval=1d&events=div,splits`;
+        const response = await fetch(url);
+        const json = await response.json();
+        if (!json.chart || json.chart.error || !json.chart.result) return {};
+        const timestamps = json.chart.result[0].timestamp;
+        const closes = json.chart.result[0].indicators.adjclose[0].adjclose;
+        const result = {};
+        timestamps.forEach((ts, i) => {
+          const date = new Date(ts * 1000).toISOString().split('T')[0];
+          result[date] = closes[i];
+        });
+        return result;
+      } catch {
+        return {};
+      }
+    };
+
+    let fullTimeline = {}, benchmarkTimeline = {}, annotations = [], chart;
+    let lastHoldings = [], priceHistories = {}, currentRange = '30';
+
+    const simulatePortfolio = async () => {
+      const allocations = parseNDJSON(portfolioDataNDJSON);
+      const start = allocations[0].Date;
+      const end = new Date().toISOString().split('T')[0];
+      const tickers = [...new Set(allocations.flatMap(a => a.Tickers))];
+      priceHistories = {};
+      for (const ticker of tickers) {
+        priceHistories[ticker] = await fetchYahooPrices(ticker, start, end);
+      }
+      fullTimeline = {};
+      annotations = [];
+
+      for (let i = 0; i < allocations.length; i++) {
+        const current = allocations[i];
+        const nextDate = allocations[i + 1]?.Date || end;
+        const allDates = Object.keys(priceHistories[current.Tickers[0]] || {}).sort();
+        const allocationStart = allDates.find(date => date >= current.Date);
+        if (!allocationStart) continue;
+        const dates = allDates.filter(date => date >= allocationStart && date < nextDate);
+        const shares = current.Tickers.map((ticker, idx) => {
+          const price = priceHistories[ticker][allocationStart];
+          return price ? (current.Dollars * current.Proportions[idx]) / price : 0;
+        });
+        lastHoldings = current.Tickers.map((ticker, idx) => ({
+          ticker, proportion: current.Proportions[idx], shares: shares[idx]
+        }));
+        annotations.push({
+          x: allocationStart,
+          label: current.Tickers.map((t, i) => `${(current.Proportions[i]*100).toFixed(0)}% ${t}`).join(', ')
+        });
+        for (const date of dates) {
+          let total = 0;
+          for (let j = 0; j < current.Tickers.length; j++) {
+            const price = priceHistories[current.Tickers[j]][date];
+            if (price) total += shares[j] * price;
+          }
+          fullTimeline[date] = total;
+        }
+      }
+
+      const benchmark = document.getElementById('benchmarkSelector').value;
+      benchmarkTimeline = benchmark ? await fetchYahooPrices(benchmark, start, end) : {};
+      renderChart(currentRange);
+      renderHoldings();
+      renderPortfolioHistory(allocations);
+    };
+
+    const renderChart = (range) => {
+      currentRange = range;
+      const dates = Object.keys(fullTimeline).sort();
+      let filteredDates = dates;
+      const today = new Date();
+      if (range !== 'all') {
+        const cutoff = new Date();
+        if (range === 'ytd') cutoff.setMonth(0, 1);
+        else cutoff.setDate(today.getDate() - parseInt(range));
+        filteredDates = dates.filter(d => new Date(d) >= cutoff);
+      }
+
+      const values = filteredDates.map(date => fullTimeline[date]);
+      const benchmarkValuesRaw = filteredDates.map(date => benchmarkTimeline[date] || null);
+      const portfolioStart = values.find(v => v != null);
+      const benchmarkStart = benchmarkValuesRaw.find(v => v != null);
+      const usePercent = document.getElementById('percentToggle').checked;
+
+      const portfolioValues = usePercent
+        ? values.map(v => (v && portfolioStart) ? ((v / portfolioStart - 1) * 100) : null)
+        : values;
+
+      const benchmarkValues = usePercent
+        ? benchmarkValuesRaw.map(v => (v && benchmarkStart) ? ((v / benchmarkStart - 1) * 100) : null)
+        : benchmarkValuesRaw;
+
+      const annotationData = annotations.filter(a => filteredDates.includes(a.x)).map(a => ({
+        type: 'point',
+        xValue: a.x,
+        yValue: usePercent ? ((fullTimeline[a.x] / portfolioStart - 1) * 100) : fullTimeline[a.x],
+        backgroundColor: 'red',
+        radius: 5,
+        label: { content: `Adjusted: ${a.label}`, enabled: true, position: 'top' }
+      }));
+
+      if (chart) chart.destroy();
+      chart = new Chart(document.getElementById('portfolioChart'), {
+        type: 'line',
+        data: {
+          labels: filteredDates,
+          datasets: [
+            {
+              label: usePercent ? 'Portfolio Return (%)' : 'Portfolio Value ($)',
+              data: portfolioValues,
+              borderWidth: 2,
+              fill: false,
+              tension: 0.1
+            },
+            ...(benchmarkValues.some(v => v !== null)
+              ? [{
+                  label: usePercent ? 'Benchmark Return (%)' : 'Benchmark Value ($)',
+                  data: benchmarkValues,
+                  borderWidth: 2,
+                  borderDash: [5,5],
+                  fill: false,
+                  tension: 0.1
+                }]
+              : [])
+          ]
+        },
+        options: {
+          responsive: true,
+          plugins: {
+            tooltip: { mode: 'nearest', intersect: false },
+            legend: { display: true },
+            annotation: { annotations: annotationData }
+          },
+          scales: {
+            x: { title: { display: true, text: 'Date' } },
+            y: {
+              title: { display: true, text: usePercent ? 'Return (%)' : 'Value ($)' },
+              min: document.getElementById('yMin').value || undefined,
+              max: document.getElementById('yMax').value || undefined
+            }
+          }
+        },
+        plugins: [Chart.registry.getPlugin('annotation')]
+      });
+    };
+
+    const renderHoldings = () => {
+      const latestDate = Object.keys(fullTimeline).sort().pop();
+      const table = document.createElement('table');
+      table.innerHTML = '<tr><th>Ticker</th><th>Allocation %</th><th>Market Value ($)</th></tr>';
+      lastHoldings.forEach(h => {
+        const latestPrice = priceHistories[h.ticker][latestDate] || 0;
+        const value = (h.shares * latestPrice).toFixed(2);
+        table.innerHTML += `<tr><td>${h.ticker}</td><td>${(h.proportion * 100).toFixed(0)}%</td><td>$${value}</td></tr>`;
+      });
+      document.getElementById('holdingsTable').innerHTML = '<h2>Current Holdings</h2>';
+      document.getElementById('holdingsTable').appendChild(table);
+    };
+
+    const renderPortfolioHistory = (allocations) => {
+      const container = document.getElementById('portfolioHistoryTable');
+      container.innerHTML = '<h2>Portfolio History</h2>';
+      const table = document.createElement('table');
+      table.innerHTML = '<tr><th>Date</th><th>Allocation</th></tr>';
+      allocations.slice().reverse().forEach(entry => {
+        const date = entry.Date;
+        const allocation = entry.Tickers.map((ticker, i) => `${(entry.Proportions[i] * 100).toFixed(0)}% ${ticker}`).join(', ');
+        table.innerHTML += `<tr><td>${date}</td><td>${allocation}</td></tr>`;
+      });
+      container.appendChild(table);
+    };
+
+    document.getElementById('rangeSelector').addEventListener('change', e => renderChart(e.target.value));
+    document.getElementById('benchmarkSelector').addEventListener('change', simulatePortfolio);
+
+    // Set default view to last 30 days on load
+    document.getElementById('rangeSelector').value = '30';
+    simulatePortfolio().then(() => renderChart('30'));
+  </script>
+</body>
+</html>
